@@ -1,0 +1,94 @@
+//@version=6
+indicator("Bot Binarias M15 + M30", overlay=true, max_labels_count=500)
+
+// Estrategia de sinais para expiracao por tempo. Nao envia ordens diretamente.
+groupSignal = "Sinais"
+rsiPeriod = input.int(14, "Periodo RSI", minval=2, group=groupSignal)
+adxPeriod = input.int(25, "Periodo ADX/DI", minval=2, group=groupSignal)
+adxMin = input.float(20.0, "ADX minimo", minval=1, step=0.5, group=groupSignal)
+rsiCall = input.float(52.0, "RSI minimo CALL", minval=1, maxval=99, step=0.5, group=groupSignal)
+rsiPut = input.float(48.0, "RSI maximo PUT", minval=1, maxval=99, step=0.5, group=groupSignal)
+useM15Adx = input.bool(true, "Exigir ADX minimo no M15", group=groupSignal)
+onlyAtClose = input.bool(true, "Confirmar apenas no fechamento", group=groupSignal)
+
+ groupRisk = "Controle visual"
+expirationBars = input.int(2, "Expiracao em velas M15", minval=1, maxval=10, group=groupRisk, tooltip="2 velas M15 = 30 minutos")
+cooldownBars = input.int(2, "Intervalo minimo entre sinais", minval=1, maxval=20, group=groupRisk)
+showPanel = input.bool(true, "Mostrar painel", group=groupRisk)
+showResult = input.bool(true, "Marcar WIN/LOSS teorico", group=groupRisk)
+
+// DMI/ADX calculado manualmente para permitir uso igual no M15 e M30.
+f_dmi(_period) =>
+    _up = ta.change(high)
+    _down = -ta.change(low)
+    _plusDM = (_up > _down and _up > 0) ? _up : 0.0
+    _minusDM = (_down > _up and _down > 0) ? _down : 0.0
+    _tr = ta.tr(true)
+    _atr = ta.rma(_tr, _period)
+    _plusDI = _atr == 0 ? 0 : 100 * ta.rma(_plusDM, _period) / _atr
+    _minusDI = _atr == 0 ? 0 : 100 * ta.rma(_minusDM, _period) / _atr
+    _sumDI = _plusDI + _minusDI
+    _dx = _sumDI == 0 ? 0 : 100 * math.abs(_plusDI - _minusDI) / _sumDI
+    _adx = ta.rma(_dx, _period)
+    [_adx, _plusDI, _minusDI]
+
+f_values(_rsiPeriod, _adxPeriod) =>
+    [_adx, _plusDI, _minusDI] = f_dmi(_adxPeriod)
+    [_adx, _plusDI, _minusDI, ta.rsi(close, _rsiPeriod), open, close]
+
+// lookahead_off evita usar informacao futura. Os sinais so aparecem com velas confirmadas.
+[adx15, plus15, minus15, rsi15, open15, close15] = request.security(syminfo.tickerid, "15", f_values(rsiPeriod, adxPeriod), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+[adx30, plus30, minus30, rsi30, open30, close30] = request.security(syminfo.tickerid, "30", f_values(rsiPeriod, adxPeriod), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+isM15 = timeframe.isminutes and timeframe.multiplier == 15
+confirmed = onlyAtClose ? barstate.isconfirmed : true
+bullM30 = adx30 >= adxMin and plus30 > minus30 and close30 > open30
+bearM30 = adx30 >= adxMin and minus30 > plus30 and close30 < open30
+strengthM15 = not useM15Adx or adx15 >= adxMin
+
+rawCall = isM15 and confirmed and bullM30 and strengthM15 and plus15 > minus15 and rsi15 >= rsiCall and close15 > open15
+rawPut = isM15 and confirmed and bearM30 and strengthM15 and minus15 > plus15 and rsi15 <= rsiPut and close15 < open15
+
+var int lastSignalBar = na
+canSignal = na(lastSignalBar) or bar_index - lastSignalBar >= cooldownBars
+callSignal = rawCall and canSignal
+putSignal = rawPut and canSignal
+
+if callSignal or putSignal
+    lastSignalBar := bar_index
+
+plotshape(callSignal, title="CALL", text="CALL", style=shape.labelup, location=location.belowbar, color=color.new(color.lime, 0), textcolor=color.black, size=size.small)
+plotshape(putSignal, title="PUT", text="PUT", style=shape.labeldown, location=location.abovebar, color=color.new(color.red, 0), textcolor=color.white, size=size.small)
+bgcolor(not isM15 ? color.new(color.orange, 90) : na, title="Aviso timeframe incorreto")
+
+// Resultado teorico: compara o fechamento da entrada com o fechamento apos N velas.
+callExpired = showResult and callSignal[expirationBars]
+putExpired = showResult and putSignal[expirationBars]
+callWin = callExpired and close > close[expirationBars]
+callLoss = callExpired and close <= close[expirationBars]
+putWin = putExpired and close < close[expirationBars]
+putLoss = putExpired and close >= close[expirationBars]
+
+plotshape(callWin or putWin, title="WIN teorico", text="WIN", style=shape.circle, location=location.bottom, color=color.new(color.green, 0), textcolor=color.white, size=size.tiny)
+plotshape(callLoss or putLoss, title="LOSS teorico", text="LOSS", style=shape.circle, location=location.bottom, color=color.new(color.maroon, 0), textcolor=color.white, size=size.tiny)
+
+alertcondition(callSignal, title="Sinal CALL M15/M30", message='{"ativo":"{{ticker}}","sinal":"CALL","preco":"{{close}}","timeframe":"15","expiracao_min":30}')
+alertcondition(putSignal, title="Sinal PUT M15/M30", message='{"ativo":"{{ticker}}","sinal":"PUT","preco":"{{close}}","timeframe":"15","expiracao_min":30}')
+alertcondition(callSignal or putSignal, title="Qualquer sinal M15/M30", message='{"ativo":"{{ticker}}","preco":"{{close}}","timeframe":"15","evento":"NOVO_SINAL"}')
+
+var table panel = table.new(position.top_right, 2, 7, border_width=1)
+if barstate.islast and showPanel
+    table.cell(panel, 0, 0, "BOT M15/M30", text_color=color.white, bgcolor=color.rgb(35, 35, 35))
+    table.cell(panel, 1, 0, isM15 ? "ATIVO" : "USE M15", text_color=isM15 ? color.lime : color.orange, bgcolor=color.rgb(35, 35, 35))
+    table.cell(panel, 0, 1, "RSI M15")
+    table.cell(panel, 1, 1, str.tostring(rsi15, "#.##"))
+    table.cell(panel, 0, 2, "ADX M15")
+    table.cell(panel, 1, 2, str.tostring(adx15, "#.##"))
+    table.cell(panel, 0, 3, "Tendencia M30")
+    table.cell(panel, 1, 3, bullM30 ? "ALTA" : bearM30 ? "BAIXA" : "LATERAL", text_color=bullM30 ? color.lime : bearM30 ? color.red : color.silver)
+    table.cell(panel, 0, 4, "ADX M30")
+    table.cell(panel, 1, 4, str.tostring(adx30, "#.##"))
+    table.cell(panel, 0, 5, "Expiracao")
+    table.cell(panel, 1, 5, str.tostring(expirationBars * 15) + " min")
+    table.cell(panel, 0, 6, "Ultimo sinal")
+    table.cell(panel, 1, 6, callSignal ? "CALL" : putSignal ? "PUT" : "AGUARDAR", text_color=callSignal ? color.lime : putSignal ? color.red : color.silver)
